@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Optional LaunchAgent for the HTTP transport.
+
+    NOT required for normal use: the stdio transport that OpenCode and Claude
+    Code use is spawned on demand by the client, so there is nothing to
+    daemonise. Install this only if you want the server reachable over TCP for
+    some other tool.
+
+        ./scripts/install_http_agent.sh
+        ./scripts/uninstall_http_agent.sh
+  -->
+  <key>Label</key>
+  <string>dev.gonczarek.local-memory.http</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/nsjg/Desktop/priv-projects/local_memory/.venv/bin/local-memory-http</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>LOCAL_MEMORY_HOST</key>
+    <string>127.0.0.1</string>
+    <key>LOCAL_MEMORY_PORT</key>
+    <string>8787</string>
+    <key>FASTMCP_SHOW_SERVER_BANNER</key>
+    <string>0</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart only on an unclean exit; do not loop forever on a config error. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/local-memory-http.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/local-memory-http.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+</dict>
+</plist>
