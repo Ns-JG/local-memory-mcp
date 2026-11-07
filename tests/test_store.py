@@ -3,19 +3,18 @@
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
 
 import numpy as np
 import pytest
 
-from local_memory.models import (
-    ConflictError,
-    MemoryRecord,
-    NotFoundError,
-    Status,
-    new_id,
-    utcnow,
-)
-from local_memory.store import Store, sanitize_fts_query
+from local_memory.config import ConfigManager
+from local_memory.errors import ConflictError, NotFoundError
+from local_memory.models import MemoryRecord, Status
+from local_memory.storage import Store, sanitize_fts_query
+from local_memory.utils import new_id, utcnow
+
+TEMPLATE = Path(__file__).parents[1] / "config.toml"
 
 
 def record(**overrides) -> MemoryRecord:
@@ -78,9 +77,19 @@ def test_fts_triggers_reindex_on_update(store: Store) -> None:
 def test_fts_bm25_ranks_title_above_body(store: Store) -> None:
     titled = store.insert(record(title="chroma", body="unrelated filler words"))
     buried = store.insert(record(title="unrelated filler words", body="mentions chroma"))
-    hits = [rid for rid, _ in store.lexical_search("chroma")]
+    weights = ConfigManager(TEMPLATE).load().bm25.model_dump()
+    hits = [rid for rid, _ in store.lexical_search("chroma", weights=weights)]
     assert hits[0] == titled.id
     assert buried.id in hits
+
+
+def test_bm25_weights_reorder_results_without_touching_the_schema(store: Store) -> None:
+    titled = store.insert(record(title="chroma", body="unrelated filler words"))
+    buried = store.insert(record(title="unrelated filler words", body="mentions chroma"))
+    on_body = {"title": 0.0, "gist": 0.0, "body": 1.0, "tags": 0.0}
+    hits = [rid for rid, _ in store.lexical_search("chroma", weights=on_body)]
+    assert hits[0] == buried.id
+    assert set(hits) == {titled.id, buried.id}
 
 
 def test_tombstone_stays_lexically_reachable(store: Store) -> None:
@@ -359,7 +368,7 @@ def test_validation_rejects_empty_title() -> None:
 
 def test_validation_rejects_oversized_gist() -> None:
     with pytest.raises(Exception, match="gist"):
-        record(gist="x" * 500).validate()
+        record(gist="x" * 500).validate(gist_max_chars=200)
 
 
 def test_content_hash_tracks_body(store: Store) -> None:

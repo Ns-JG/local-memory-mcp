@@ -1,9 +1,8 @@
-"""Dense index and score fusion.
+"""Dense index: a brute-force cosine scan over a float32 matrix held in memory.
 
-The dense side is a brute-force cosine scan over a float32 matrix held in
-memory. At the scale this system targets (10^2 to 10^4 records) that beats an
-HNSW index: no build step, no rebuild when the model changes, no index
-corruption, and a 15 MB matrix reloads in about 10 ms.
+At the scale this system targets (10^2 to 10^4 records) that beats an HNSW
+index: no build step, no rebuild when the model changes, no index corruption,
+and a 15 MB matrix reloads in about 10 ms.
 
 Cross-process staleness is handled by ``store_epoch``. Every commit bumps it,
 so a reader can cheaply detect that another process (the other agent's stdio
@@ -14,11 +13,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from .models import ConflictError, LocalMemoryError
-from .store import Store
-
-DEFAULT_PREFETCH_K = 20
-MIN_PREFETCH_MULTIPLIER = 4
+from local_memory.errors import LocalMemoryError
+from local_memory.retrieval.fusion import DEFAULT_PREFETCH_K
+from local_memory.storage import Store
 
 
 class DenseIndex:
@@ -128,49 +125,3 @@ class DenseIndex:
         partition = np.argpartition(-scores, take - 1)[:take]
         partition = partition[np.argsort(-scores[partition])]
         return [(self._ids[i], float(scores[i])) for i in partition if np.isfinite(scores[i])]
-
-
-def prefetch_count(k: int) -> int:
-    return max(MIN_PREFETCH_MULTIPLIER * k, DEFAULT_PREFETCH_K)
-
-
-def rrf_fuse(
-    dense_hits: list[tuple[str, float]],
-    lexical_hits: list[tuple[str, float]],
-    *,
-    k: int = 60,
-    limit: int = 10,
-) -> list[tuple[str, float, int | None, int | None]]:
-    """Reciprocal Rank Fusion. Returns ``(id, score, dense_rank, lexical_rank)``.
-
-    ``k=60`` is the value from the original Cormack et al. paper. RRF consumes
-    only rank, never raw score, which is exactly why it works across a cosine
-    score and a BM25 score that share no scale. The raw scores are discarded -
-    this is also why the per-channel ranks are returned, so callers can report
-    something an LLM can reason about.
-    """
-    if k < 1:
-        raise ValueError("rrf k must be >= 1")
-
-    dense_rank = {rid: rank for rank, (rid, _) in enumerate(dense_hits)}
-    lexical_rank = {rid: rank for rank, (rid, _) in enumerate(lexical_hits)}
-
-    scores: dict[str, float] = {}
-    for ranks in (dense_rank, lexical_rank):
-        for record_id, rank in ranks.items():
-            scores[record_id] = scores.get(record_id, 0.0) + 1.0 / (k + rank + 1)
-
-    ordered = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
-    return [
-        (record_id, score, dense_rank.get(record_id), lexical_rank.get(record_id))
-        for record_id, score in ordered[:limit]
-    ]
-
-
-__all__ = [
-    "ConflictError",
-    "DenseIndex",
-    "DEFAULT_PREFETCH_K",
-    "prefetch_count",
-    "rrf_fuse",
-]

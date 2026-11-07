@@ -7,16 +7,68 @@ environment forbids binding, so the suite still runs in a locked-down sandbox.
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
-from local_memory import mcp_http, mcp_stdio
+from local_memory.config import ConfigManager
+from local_memory.mcp import http as mcp_http
+from local_memory.mcp import stdio as mcp_stdio
 
 LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+TESTS_DIR = Path(__file__).parent
+TEMPLATE = TESTS_DIR.parent / "config.toml"
+
+# Runs the real transport in a subprocess, with the model swapped for the fake.
+DRIVER = f"""
+import sys
+sys.path.insert(0, {str(TESTS_DIR)!r})
+from conftest import FakeEmbedder
+import local_memory.app as app
+app.build_embedder = lambda *args, **kwargs: FakeEmbedder()
+from local_memory.mcp.http import main
+raise SystemExit(main())
+"""
+
+
+def _write_config(path: Path, *, host: str = "127.0.0.1", port: int = 8787) -> Path:
+    """The template with db, model cache and [server] pointed at tmp."""
+    text = TEMPLATE.read_text()
+    for key, value in {
+        "db_path": f'"{path.parent / "memory.db"}"',
+        "model_cache": f'"{path.parent / "models"}"',
+        "host": f'"{host}"',
+        "port": port,
+    }.items():
+        text = re.sub(rf"(?m)^{key} = .*$", f"{key} = {value}", text)
+    path.write_text(text)
+    shutil.copy(TEMPLATE.with_name("local_memory_instructions.md"), path.parent)
+    return path
+
+
+@pytest.fixture
+def http_config(tmp_path, monkeypatch):
+    """Call with host/port; ConfigManager() then resolves to that file."""
+
+    def write(host: str = "127.0.0.1", port: int = 8787) -> None:
+        path = _write_config(tmp_path / "config.toml", host=host, port=port)
+        monkeypatch.setattr(ConfigManager, "GLOBAL_PATH", path)
+
+    return write
+
+
+def _server_env(tmp_path: Path, port: int) -> dict[str, str]:
+    """HOME points at tmp, so ConfigManager finds our config as the global one."""
+    config = tmp_path / ".config" / "local-memory" / "config.toml"
+    config.parent.mkdir(parents=True)
+    _write_config(config, port=port)
+    return {**os.environ, "HOME": str(tmp_path), "FASTMCP_SHOW_SERVER_BANNER": "0"}
 
 
 def _free_port() -> int:
@@ -56,9 +108,9 @@ def test_stdio_module_exposes_main() -> None:
         ("192.168.1.5", False),
     ],
 )
-def test_http_refuses_non_loopback(monkeypatch, capsys, host: str, ok: bool) -> None:
+def test_http_refuses_non_loopback(monkeypatch, capsys, http_config, host: str, ok: bool) -> None:
     """This server has no authentication; it must never be reachable off-host."""
-    monkeypatch.setenv("LOCAL_MEMORY_HOST", host)
+    http_config(host=host)
 
     started: list[str] = []
 
@@ -66,8 +118,7 @@ def test_http_refuses_non_loopback(monkeypatch, capsys, host: str, ok: bool) -> 
         def run(self, **kwargs):
             started.append(kwargs["host"])
 
-    monkeypatch.setattr(mcp_http, "build_server", lambda: FakeServer(), raising=False)
-    monkeypatch.setattr("local_memory.server.build_server", lambda: FakeServer(), raising=False)
+    monkeypatch.setattr("local_memory.mcp.server.build_server", lambda: FakeServer())
 
     code = mcp_http.main()
     assert (code == 0) is ok
@@ -78,10 +129,8 @@ def test_http_refuses_non_loopback(monkeypatch, capsys, host: str, ok: bool) -> 
         assert started == [host]
 
 
-def test_http_defaults_to_loopback_port(monkeypatch) -> None:
-    monkeypatch.delenv("LOCAL_MEMORY_HOST", raising=False)
-    monkeypatch.delenv("LOCAL_MEMORY_PORT", raising=False)
-    assert mcp_http.DEFAULT_HOST in LOOPBACK
+def test_template_server_binds_loopback() -> None:
+    assert ConfigManager(TEMPLATE).load().server.host in LOOPBACK
 
 
 # -- http end to end --------------------------------------------------------
@@ -92,17 +141,9 @@ def test_http_transport_serves_tools(tmp_path) -> None:
     from fastmcp import Client
 
     port = _free_port()
-    env = {
-        **os.environ,
-        "XDG_CONFIG_HOME": str(tmp_path / "config"),
-        "XDG_DATA_HOME": str(tmp_path / "data"),
-        "XDG_CACHE_HOME": str(tmp_path / "cache"),
-        "LOCAL_MEMORY_HOST": "127.0.0.1",
-        "LOCAL_MEMORY_PORT": str(port),
-        "FASTMCP_SHOW_SERVER_BANNER": "0",
-    }
+    env = _server_env(tmp_path, port)
     proc = subprocess.Popen(
-        [sys.executable, "-m", "local_memory.mcp_http"],
+        [sys.executable, "-c", DRIVER],
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -148,7 +189,7 @@ def test_http_transport_serves_tools(tmp_path) -> None:
             proc.kill()
 
 
-def test_http_enables_origin_protection(monkeypatch) -> None:
+def test_http_enables_origin_protection(monkeypatch, http_config) -> None:
     """A web page the user has open must not be able to reach loopback MCP.
 
     Binding to 127.0.0.1 stops remote hosts but not the user's own browser:
@@ -161,9 +202,8 @@ def test_http_enables_origin_protection(monkeypatch) -> None:
         def run(self, **kwargs):
             captured.update(kwargs)
 
-    monkeypatch.setattr("local_memory.server.build_server", lambda: FakeServer())
-    monkeypatch.setenv("LOCAL_MEMORY_HOST", "127.0.0.1")
-    monkeypatch.setenv("LOCAL_MEMORY_PORT", "9999")
+    monkeypatch.setattr("local_memory.mcp.server.build_server", lambda: FakeServer())
+    http_config(port=9999)
 
     assert mcp_http.main() == 0
     assert captured["transport"] == "http"
@@ -181,17 +221,9 @@ def test_http_origin_protection_blocks_a_foreign_origin(tmp_path) -> None:
     from fastmcp import Client
 
     port = _free_port()
-    env = {
-        **os.environ,
-        "XDG_CONFIG_HOME": str(tmp_path / "config"),
-        "XDG_DATA_HOME": str(tmp_path / "data"),
-        "XDG_CACHE_HOME": str(tmp_path / "cache"),
-        "LOCAL_MEMORY_HOST": "127.0.0.1",
-        "LOCAL_MEMORY_PORT": str(port),
-        "FASTMCP_SHOW_SERVER_BANNER": "0",
-    }
+    env = _server_env(tmp_path, port)
     proc = subprocess.Popen(
-        [sys.executable, "-m", "local_memory.mcp_http"],
+        [sys.executable, "-c", DRIVER],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

@@ -7,17 +7,14 @@ memory store with no authentication, and it must not be reachable off-host.
 
 from __future__ import annotations
 
-import os
-
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8787
+from local_memory.config import ConfigManager
 
 
 def main() -> int:
-    from .server import build_server
+    from local_memory.mcp.server import build_server
 
-    host = os.environ.get("LOCAL_MEMORY_HOST", DEFAULT_HOST)
-    port = int(os.environ.get("LOCAL_MEMORY_PORT", DEFAULT_PORT))
+    server = ConfigManager().load().server
+    host, port = server.host, server.port
     if host not in {"127.0.0.1", "::1", "localhost"}:
         print(
             f"local-memory: refusing to bind {host!r}; this server has no "

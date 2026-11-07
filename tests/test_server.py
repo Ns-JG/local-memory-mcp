@@ -12,10 +12,8 @@ import json
 import pytest
 from fastmcp import Client, FastMCP
 
+from local_memory.mcp.server import DETAIL_TIERS, instructions, register_tools
 from local_memory.models import Status
-from local_memory.server import DETAIL_TIERS, SERVER_INSTRUCTIONS, register_tools
-from local_memory.service import MemoryService
-from local_memory.store import Store
 
 EXPECTED_TOOLS = {
     "memory_search",
@@ -28,14 +26,9 @@ EXPECTED_TOOLS = {
 
 
 @pytest.fixture
-def service(store: Store, embedder) -> MemoryService:
-    return MemoryService(store, embedder)
-
-
-@pytest.fixture
-async def client(service: MemoryService):
-    mcp = FastMCP(name="local-memory", instructions=SERVER_INSTRUCTIONS)
-    register_tools(mcp, service)
+async def client(service, config, config_manager):
+    mcp = FastMCP(name="local-memory", instructions=instructions(config))
+    register_tools(mcp, service, config_manager.load)
     async with Client(mcp) as connected:
         yield connected
 
@@ -63,13 +56,26 @@ async def test_every_tool_is_documented(client: Client) -> None:
         assert tool.description.strip()
 
 
-async def test_server_instructions_teach_the_delete_semantics() -> None:
+async def test_server_instructions_teach_the_delete_semantics(config) -> None:
     """The agent must not learn that memory_forget deletes immediately."""
-    lowered = SERVER_INSTRUCTIONS.lower()
-    assert "supersedes_id" in SERVER_INSTRUCTIONS
+    text_ = instructions(config)
+    lowered = text_.lower()
+    assert "supersedes_id" in text_
     assert "confirm" in lowered
     assert "reinforce" in lowered
     assert "never tell the user" in lowered
+
+
+async def test_server_instructions_name_the_user_from_the_config(config) -> None:
+    text_ = instructions(config)
+    assert config.user_name in text_
+    assert "{user_name}" not in text_
+
+
+async def test_server_instructions_list_seed_kinds_and_scopes(config) -> None:
+    text_ = instructions(config)
+    assert all(kind in text_ for kind in config.seed_kinds)
+    assert "user-configurable" in text_
 
 
 # -- store round trip -------------------------------------------------------
@@ -105,6 +111,17 @@ async def test_store_reinforcement_is_explained(client: Client) -> None:
     second = await payload(await client.call_tool("memory_store", args))
     assert second["outcome"] == "reinforced"
     assert "reinforced" in second["note"]
+
+
+async def test_store_defaults_to_the_configured_scope(client: Client, config) -> None:
+    stored = await payload(await client.call_tool("memory_store", {"title": "T", "body": "b"}))
+    assert stored["record"]["scope"] == config.scopes.default
+
+
+async def test_store_rejects_unknown_scope_listing_available(client: Client, config) -> None:
+    result = await client.call_tool("memory_store", {"title": "T", "body": "b", "scope": "nope"})
+    assert text(result).startswith("store failed:")
+    assert all(name in text(result) for name in config.scopes.available)
 
 
 async def test_store_rejects_empty_title_as_a_plain_string(client: Client) -> None:
@@ -255,7 +272,14 @@ async def test_stats_reports_the_model(seeded: Client) -> None:
     stats = await payload(await seeded.call_tool("memory_stats"))
     assert stats["model"] == "fake/hashed-bow"
     assert stats["total"] == 2
-    assert "scope_paths" in stats
+
+
+async def test_stats_reports_scopes_and_missing_paths(seeded: Client, config) -> None:
+    stats = await payload(await seeded.call_tool("memory_stats"))
+    assert set(stats["scopes"]) == set(config.scopes.available)
+    assert stats["default_scope"] == config.scopes.default
+    missing = [p for rule in config.scopes.rules.values() for p in rule.paths if not p.exists()]
+    assert len(stats["scope_warnings"]) == len(missing)
 
 
 def test_detail_tiers_match_the_service() -> None:

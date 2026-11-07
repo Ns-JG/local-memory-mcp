@@ -1,0 +1,55 @@
+# === Template for local-memory configuration ===
+user_name = "<your-name-or-nick>" # how agents refer to you in the MCP instructions
+db_path = "~/.local/share/local-memory/memory.db"
+model_cache = "~/.cache/local-memory/models"
+default_model = "BAAI/bge-small-en-v1.5"
+threads = 3
+dedup_threshold = 0.92
+rrf_k = 60
+tombstone_retention_days = 730
+
+# === Records ===
+# Agent-facing instructions served by the MCP; relative to this file.
+instructions_path = "local_memory_instructions.md"
+gist_max_chars = 200
+# Starting vocabulary for `kind`. Agents may coin new kinds; these are only seeds.
+seed_kinds = [
+    "pattern",
+    "decision",
+    "project",
+    "preference",
+    "fact",
+    "lesson",
+    "correction",
+]
+
+# === HTTP transport (loopback only) ===
+[server]
+host = "127.0.0.1"
+port = 8787
+
+# === BM25 column weights (numeric tuning only; the key set must match the FTS columns) ===
+[bm25]
+title = 10.0 # the compressed identity of a record
+gist = 5.0
+tags = 3.0
+body = 1.0
+
+# === Memo Scopes ===
+[scopes]
+available = [
+    "general",
+    "university",
+    "work",
+]
+default = "general" # Any non-specified DIR
+
+[scopes.university]
+paths = [
+    "~/Desktop/pwr_mgr"
+]
+
+[scopes.work]
+paths = [
+    "~/Desktop/work"
+]

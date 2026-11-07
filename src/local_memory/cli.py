@@ -1,32 +1,31 @@
-"""Command line interface.
+"""CLI for everyday use. Without an agent in the loop.
 
-`local-memory` is the operator surface: inspect, repair and script the store
-without an agent in the loop. The MCP tools are the agent surface; this is for
-NsJG.
+`local-memory` is the operator surface for:
+    - inspection
+    - repairing
+    - scripting the store
+
+The MCP tools are the agent surface, here is user space.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 from typing import Protocol
 
-from .browse import BROWSABLE_STATUSES
-from .embedder import build_embedder
-from .models import (
-    MODEL_REGISTRY,
-    SEED_KINDS,
-    Config,
-    LocalMemoryError,
-    Status,
-    ValidationError,
-    load_config,
-    resolve_model,
-    write_default_config,
-)
-from .store import Store
+from rich.console import Console
+from rich.text import Text
+
+from local_memory.browse import BROWSABLE_STATUSES
+from local_memory.config import Config, ConfigManager
+from local_memory.embedders import EmbedderRepository, build_embedder
+from local_memory.errors import LocalMemoryError, ValidationError
+from local_memory.models import Status
+from local_memory.storage import Store
 
 
 class _SearchHit(Protocol):
@@ -53,33 +52,38 @@ class _Service(Protocol):
 
 
 def _service(config: Config) -> _Service:
-    from .server import build_service
+    from local_memory.app import build_service
 
-    return build_service(config)  # type: ignore[return-value]
+    return build_service()  # type: ignore[return-value]
 
 
-def _print(data: object) -> None:
+def _print_as_json(data: object) -> None:
     print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+
+
+# Colour only on a terminal; rich drops it when piped or when NO_COLOR is set.
+_out = Console(highlight=False, markup=False)
+_err = Console(stderr=True, highlight=False, markup=False)
+
+
+def _ok(message: str) -> None:
+    _out.print(message, style="green", soft_wrap=True)
+
+
+def _missing(message: str, *, err: bool = False) -> None:
+    (_err if err else _out).print(message, style="red", soft_wrap=True)
 
 
 # -- commands ---------------------------------------------------------------
 
 
 def cmd_config(args: argparse.Namespace, config: Config) -> int:
-    path = write_default_config()
+    path = ConfigManager().path
     if args.json:
-        _print(
+        _print_as_json(
             {
                 "config_path": str(path),
-                "db_path": str(config.db_path),
-                "model_cache": str(config.model_cache),
-                "default_model": config.default_model,
-                "dedup_threshold": config.dedup_threshold,
-                "rrf_k": config.rrf_k,
-                "tombstone_retention_days": config.tombstone_retention_days,
-                "scope_paths": {
-                    s: [str(p) for p in r.paths] for s, r in config.scope_paths.items()
-                },
+                **config.model_dump(mode="json"),
                 "scope_warnings": config.scope_warnings(),
             }
         )
@@ -87,18 +91,29 @@ def cmd_config(args: argparse.Namespace, config: Config) -> int:
 
     print(f"config        {path}")
     print(f"database      {config.db_path}")
-    print(f"model         {config.default_model} (dim {resolve_model(config.default_model).dim})")
+    dim = EmbedderRepository.resolve_model(config.default_model).dim
+    print(f"model         {config.default_model} (dim {dim})")
     print(f"model cache   {config.model_cache}")
     print(f"dedup         {config.dedup_threshold}")
     print(f"rrf k         {config.rrf_k}")
     for warning in config.scope_warnings():
-        print(f"  ! {warning}", file=sys.stderr)
+        _missing(f"  ! {warning}", err=True)
+    return 0
+
+
+def cmd_export_config(args: argparse.Namespace, config: Config) -> int:
+    source = ConfigManager().path
+    try:
+        shutil.copyfile(source, args.output)
+    except OSError as exc:
+        raise LocalMemoryError(f"cannot export {source} to {args.output}: {exc.strerror}") from exc
+    _ok(f"exported {source} -> {args.output}")
     return 0
 
 
 def cmd_stats(args: argparse.Namespace, config: Config) -> int:
     service = _service(config)
-    _print(service.stats())
+    _print_as_json(service.stats())
     return 0
 
 
@@ -118,7 +133,7 @@ def cmd_search(args: argparse.Namespace, config: Config) -> int:
 
 def cmd_get(args: argparse.Namespace, config: Config) -> int:
     service = _service(config)
-    _print(_record(service.get(args.id)))
+    _print_as_json(_record(service.get(args.id)))
     return 0
 
 
@@ -129,7 +144,7 @@ def cmd_browse(args: argparse.Namespace, config: Config) -> int:
     :class:`MemoryService`, so listing costs no model load. Search inside the
     viewer builds the service lazily on first use.
     """
-    from . import browse as browse_mod
+    from local_memory import browse as browse_mod
 
     statuses = tuple(args.status) if args.status else (Status.ACTIVE.value,)
     for value in statuses:
@@ -155,7 +170,7 @@ def cmd_browse(args: argparse.Namespace, config: Config) -> int:
 
 def cmd_reindex(args: argparse.Namespace, config: Config) -> int:
     """Recompute vectors. Required after a model change."""
-    spec = resolve_model(args.model or config.default_model)
+    spec = EmbedderRepository.resolve_model(args.model or config.default_model)
     embedder = build_embedder(spec.name, config.model_cache, threads=config.threads)
     with Store(config.db_path) as store:
         pending = (
@@ -166,6 +181,7 @@ def cmd_reindex(args: argparse.Namespace, config: Config) -> int:
         if not pending:
             print(f"nothing to do: every record is embedded with {spec.name}")
             return 0
+
         print(f"re-embedding {len(pending)} record(s) with {spec.name} ({spec.dim}d)")
         records = store.get_many(pending)
         vectors = embedder.embed_documents([f"{r.title}\n{r.body}" for r in records])
@@ -173,17 +189,17 @@ def cmd_reindex(args: argparse.Namespace, config: Config) -> int:
         for record, vector in zip(records, vectors, strict=True):
             store.put_vector(record.id, vector)
             store.set_embedding_info(record.id, spec.name, spec.dim)
-    print(f"done: {len(pending)} record(s) embedded with {spec.name}")
+    _ok(f"done: {len(pending)} record(s) embedded with {spec.name}")
     return 0
 
 
 def cmd_models(args: argparse.Namespace, config: Config) -> int:
-    _print(
+    _print_as_json(
         {
             "default": config.default_model,
             "registry": {
                 name: {"dim": s.dim, "note": s.note, "query_prefix": s.query_prefix}
-                for name, s in MODEL_REGISTRY.items()
+                for name, s in EmbedderRepository.get_model_registry().items()
             },
         }
     )
@@ -201,11 +217,11 @@ def cmd_kinds(args: argparse.Namespace, config: Config) -> int:
         counts: dict[str, int] = {}
         for record in store.all_records():
             counts[record.kind] = counts.get(record.kind, 0) + 1
-        print("seeds:  " + ", ".join(SEED_KINDS))
+        print("seeds:  " + ", ".join(config.seed_kinds))
         if counts:
             print("in use:")
             for kind, count in sorted(counts.items()):
-                origin = "seed" if kind in SEED_KINDS else "agent-defined"
+                origin = "seed" if kind in config.seed_kinds else "agent-defined"
                 print(f"  {kind}  ({count} record(s), {origin})")
         else:
             print("in use: (none)")
@@ -232,29 +248,30 @@ def cmd_purge(args: argparse.Namespace, config: Config) -> int:
             print(f"no tombstones older than {config.tombstone_retention_days} days")
             return 0
         if not args.yes:
-            print(f"{len(expired)} tombstone(s) eligible for purge; pass --yes to confirm")
+            _missing(f"{len(expired)} tombstone(s) eligible for purge; pass --yes to confirm")
             return 1
         for record in expired:
             store.hard_delete(record.id)
-        print(f"purged {len(expired)} tombstone(s)")
+        _ok(f"purged {len(expired)} tombstone(s)")
     return 0
 
 
 def cmd_scopes(args: argparse.Namespace, config: Config) -> int:
     if args.path:
-        print(config.scope_for_path(Path(args.path)))
+        print(config.scopes.for_path(Path(args.path)))
         return 0
-    for scope, rule in config.scope_paths.items():
-        print(f"{scope}:")
-        for path in rule.paths:
-            print(f"  {'ok ' if path.exists() else 'MISSING'} {path}")
+    for scope in config.scopes.available:
+        print(f"{scope}{' (default)' if scope == config.scopes.default else ''}:")
+        for path in config.scopes.rules[scope].paths if scope in config.scopes.rules else ():
+            mark = ("ok ", "green") if path.exists() else ("MISSING", "red")
+            _out.print(Text.assemble("  ", mark, f" {path}"), soft_wrap=True)
     return 0
 
 
 def cmd_doctor(args: argparse.Namespace, config: Config) -> int:
     """Check the store and the model agree. Read-only."""
     problems: list[str] = []
-    spec = resolve_model(config.default_model)
+    spec = EmbedderRepository.resolve_model(config.default_model)
     info: dict[str, object] = {
         "db_path": str(config.db_path),
         "db_exists": config.db_path.exists(),
@@ -284,7 +301,7 @@ def cmd_doctor(args: argparse.Namespace, config: Config) -> int:
     problems.extend(config.scope_warnings())
     info["problems"] = problems
     info["ok"] = not problems
-    _print(info)
+    _print_as_json(info)
     return 0 if info["ok"] else 1
 
 
@@ -319,6 +336,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("config", help="show the resolved configuration")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_config)
+
+    p = sub.add_parser("export-config", help="copy your config.toml to a path")
+    p.add_argument("output", type=Path)
+    p.set_defaults(func=cmd_export_config)
 
     p = sub.add_parser("stats", help="record counts, model, kinds")
     p.set_defaults(func=cmd_stats)
@@ -389,10 +410,10 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
-        config = load_config()
+        config = ConfigManager().load()
         return int(args.func(args, config))
     except LocalMemoryError as exc:
-        print(f"local-memory: {exc}", file=sys.stderr)
+        _missing(f"local-memory: {exc}", err=True)
         return 1
     except KeyboardInterrupt:
         return 130

@@ -292,16 +292,16 @@ a table of titles and short bodies is not a real loss.
 ## Layout
 
 ```
-models.py     record schema, vocabularies, model registry, config
-store.py      SQLite + FTS5 + vectors + optimistic writes
-embedder.py   fastembed wrapper, query/document prefixes
-index.py      dense matrix, cosine scan, RRF
-service.py    search / get / store / forget / confirm   ← the product
-browse.py     read-only terminal viewer over Store       ← reads only
-server.py     MCP tool surface, thin adapters
+config.py     Config + ConfigManager: typed, validated config.toml
+models.py     record schema, search hit, status. errors.py, utils.py
+embedders/    fastembed wrapper, model registry, query/document prefixes
+storage/      schema + migrations, connection and retry, FTS5, record CRUD
+retrieval/    dense index, RRF
+service.py    search / get / store / forget / confirm   <- the product
+app.py        composition root
+browse/       read-only terminal viewer over Store       <- reads only
+mcp/          MCP tools, stdio and http transports
 cli.py        operator CLI
-mcp_stdio.py  default transport
-mcp_http.py   optional transport, loopback only
 ```
 
 The service layer holds the logic. Transports only unpack arguments and format

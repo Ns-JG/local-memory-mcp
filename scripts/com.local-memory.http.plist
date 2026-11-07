@@ -11,23 +11,21 @@
     daemonise. Install this only if you want the server reachable over TCP for
     some other tool.
 
+    __LABEL__ and __BINARY__ are filled in by install_http_agent.sh.
+
         ./scripts/install_http_agent.sh
-        ./scripts/uninstall_http_agent.sh
+        ./scripts/install_http_agent.sh --uninstall
   -->
   <key>Label</key>
-  <string>dev.gonczarek.local-memory.http</string>
+  <string>__LABEL__</string>
 
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/nsjg/Desktop/priv-projects/local_memory/.venv/bin/local-memory-http</string>
+    <string>__BINARY__</string>
   </array>
 
   <key>EnvironmentVariables</key>
   <dict>
-    <key>LOCAL_MEMORY_HOST</key>
-    <string>127.0.0.1</string>
-    <key>LOCAL_MEMORY_PORT</key>
-    <string>8787</string>
     <key>FASTMCP_SHOW_SERVER_BANNER</key>
     <string>0</string>
   </dict>

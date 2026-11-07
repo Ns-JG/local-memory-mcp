@@ -1,9 +1,10 @@
 """The memory service: search, get, store, forget, confirm.
 
-Pure with respect to I/O policy - it talks to a :class:`Store` and an
-:class:`Embedder` and nothing else. No network calls, no LLM, no environment
-reads. That is what makes it testable with a fake embedder in milliseconds and
-what keeps the stdio and HTTP transports interchangeable.
+Pure with respect to I/O policy - it talks to a :class:`Store`, an
+:class:`Embedder` and a config provider, nothing else. No network calls, no LLM,
+no environment reads. The config provider is called per operation, so scope
+and threshold edits apply without a restart. That is what makes it testable with a
+fake embedder in milliseconds and what keeps the stdio and HTTP transports interchangeable.
 
 Two behaviours are worth reading before using it:
 
@@ -19,22 +20,17 @@ Two behaviours are worth reading before using it:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 
-from .embedder import Embedder
-from .index import DenseIndex, prefetch_count, rrf_fuse
-from .models import (
-    SEARCHABLE,
-    MemoryRecord,
-    SearchHit,
-    Status,
-    ValidationError,
-    new_id,
-    utcnow,
-)
-from .store import Store
+from local_memory.config import Config
+from local_memory.embedders import Embedder
+from local_memory.errors import ValidationError
+from local_memory.models import SEARCHABLE, MemoryRecord, SearchHit, Status
+from local_memory.retrieval import DenseIndex, prefetch_count, rrf_fuse
+from local_memory.storage import Store
+from local_memory.utils import new_id, utcnow
 
 DETAIL_TIERS = ("titles", "snippets", "full")
 DEFAULT_K = 5
@@ -56,14 +52,11 @@ class MemoryService:
         self,
         store: Store,
         embedder: Embedder,
-        *,
-        dedup_threshold: float = 0.92,
-        rrf_k: int = 60,
+        config: Callable[[], Config],
     ) -> None:
         self.store = store
         self.embedder = embedder
-        self.dedup_threshold = dedup_threshold
-        self.rrf_k = rrf_k
+        self.config = config
         self.index = DenseIndex(store, embedder.spec.dim)
 
     # -- read --------------------------------------------------------------
@@ -99,10 +92,16 @@ class MemoryService:
         query_vector = self.embedder.embed_query(query)
 
         dense = self.index.search(query_vector, allowed_ids=allowed, limit=prefetch)
+        config = self.config()
         lexical = self.store.lexical_search(
-            query, scope=scope, kind=kind, statuses=SEARCHABLE, limit=prefetch
+            query,
+            scope=scope,
+            kind=kind,
+            statuses=SEARCHABLE,
+            limit=prefetch,
+            weights=config.bm25.model_dump(),
         )
-        fused = rrf_fuse(dense, lexical, k=self.rrf_k, limit=k)
+        fused = rrf_fuse(dense, lexical, k=config.rrf_k, limit=k)
         if not fused:
             return []
 
@@ -152,18 +151,26 @@ class MemoryService:
         body: str,
         gist: str = "",
         kind: str = "pattern",
-        scope: str = "general",
+        scope: str | None = None,
         tags: Sequence[str] | None = None,
         supersedes_id: str | None = None,
         confidence: float = 0.5,
         source: str = "agent_inferred",
     ) -> tuple[MemoryRecord, str]:
-        """Create or reinforce. Returns ``(record, outcome)``.
+        """Create or reinforce.
 
-        ``outcome`` is ``"created"``, ``"reinforced"``, or ``"superseded"``.
+        Returns (record, outcome), which are:
+            - record (the stored record)
+            - outcome (created|reinforced|superseded)
         """
+        config = self.config()
+        scope = scope or config.scopes.default
+        if scope not in config.scopes.available:
+            raise ValidationError(
+                f"unknown scope {scope!r}; available: {', '.join(config.scopes.available)}"
+            )
         if not gist:
-            gist = _derive_gist(body)
+            gist = _derive_gist(body, config.gist_max_chars)
 
         candidate = MemoryRecord(
             id=new_id(),
@@ -177,12 +184,12 @@ class MemoryService:
             confidence=confidence,
             source=source,
         )
-        candidate.validate()
+        candidate.validate(gist_max_chars=config.gist_max_chars)
 
         vector = self.embedder.embed_documents([embed_text(candidate.title, candidate.body)])[0]
 
         if supersedes_id is None:
-            duplicate = self._find_duplicate(vector)
+            duplicate = self._find_duplicate(vector, config.dedup_threshold)
             if duplicate is not None:
                 return self._reinforce(duplicate, candidate), "reinforced"
 
@@ -205,12 +212,14 @@ class MemoryService:
         self.index.add(stored.id, vector)
         return stored, outcome
 
-    def _find_duplicate(self, vector: np.ndarray, limit: int = 5) -> MemoryRecord | None:
-        """Nearest live record above the dedup threshold, if any."""
+    def _find_duplicate(
+        self, vector: np.ndarray, threshold: float, limit: int = 5
+    ) -> MemoryRecord | None:
+        """Nearest live record at or above ``threshold``, if any."""
         self.index.refresh_if_stale()
         allowed = set(self.store.candidate_ids(statuses=list(SEARCHABLE)))
         for record_id, score in self.index.search(vector, allowed_ids=allowed, limit=limit):
-            if score >= self.dedup_threshold:
+            if score >= threshold:
                 return self.store.get(record_id)
         return None
 
@@ -279,7 +288,7 @@ class MemoryService:
         return self.store_record(supersedes_id=record_id, **kwargs)  # type: ignore[arg-type]
 
 
-def _derive_gist(body: str, limit: int = 200) -> str:
+def _derive_gist(body: str, limit: int) -> str:
     """First sentence, clipped to the preview budget.
 
     Deterministic on purpose: a server-side LLM call would make writes

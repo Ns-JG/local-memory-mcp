@@ -9,14 +9,10 @@ import dataclasses
 
 import pytest
 
-from local_memory.models import (
-    ConflictError,
-    NotFoundError,
-    Status,
-    ValidationError,
-)
+from local_memory.errors import ConflictError, NotFoundError, ValidationError
+from local_memory.models import Status
 from local_memory.service import MemoryService, _derive_gist
-from local_memory.store import Store
+from local_memory.storage import Store
 
 
 def put(service: MemoryService, title: str, body: str, **kwargs):
@@ -114,10 +110,11 @@ def test_different_facts_are_not_deduped(service: MemoryService) -> None:
     assert service.store.count() == 2
 
 
-def test_dedup_can_be_disabled_for_distinct_but_similar_records(store: Store, embedder) -> None:
-    from conftest import FakeEmbedder
-
-    service = MemoryService(store, FakeEmbedder(), dedup_threshold=1.01)
+def test_dedup_can_be_disabled_for_distinct_but_similar_records(
+    store: Store, embedder, config
+) -> None:
+    no_dedup = config.model_copy(update={"dedup_threshold": 1.01})
+    service = MemoryService(store, embedder, lambda: no_dedup)
     put(service, "Same", "identical body")
     _, outcome = put(service, "Same", "identical body")
     assert outcome == "created"
@@ -250,12 +247,14 @@ def test_search_on_empty_store_is_empty(service: MemoryService) -> None:
     assert service.search("anything") == []
 
 
-def test_search_sees_records_written_by_another_process(store: Store, embedder) -> None:
+def test_search_sees_records_written_by_another_process(
+    store: Store, embedder, config_manager
+) -> None:
     """Two servers, one database: the reader must notice the writer."""
     from conftest import FakeEmbedder
 
-    writer = MemoryService(store, embedder)
-    reader = MemoryService(Store(store.db_path), FakeEmbedder())
+    writer = MemoryService(store, embedder, config_manager.load)
+    reader = MemoryService(Store(store.db_path), FakeEmbedder(), config_manager.load)
     writer.store_record(title="Cross process", body="written by the other server")
     assert [h.title for h in reader.search("cross process")] == ["Cross process"]
 
@@ -361,12 +360,12 @@ def test_stats_separates_pending_delete(populated: MemoryService) -> None:
 
 
 def test_derive_gist_clips_long_first_sentence() -> None:
-    gist = _derive_gist("word " * 100)
+    gist = _derive_gist("word " * 100, 200)
     assert len(gist) <= 200
 
 
 def test_derive_gist_collapses_whitespace() -> None:
-    assert _derive_gist("a\n\n  b   c.") == "a b c."
+    assert _derive_gist("a\n\n  b   c.", 200) == "a b c."
 
 
 # -- concurrency ------------------------------------------------------------
@@ -383,3 +382,27 @@ def test_reinforcement_detects_concurrent_write(service: MemoryService) -> None:
 
     with pytest.raises(ConflictError):
         service._reinforce(live, dataclasses.replace(live, tags=["x"]))
+
+
+# -- scopes come from config ------------------------------------------------
+
+
+def test_store_uses_the_default_scope_when_none_is_given(service: MemoryService, config) -> None:
+    record, _ = put(service, "No scope given", "body text")
+    assert record.scope == config.scopes.default
+
+
+def test_unknown_scope_is_rejected_and_lists_the_available_ones(service: MemoryService) -> None:
+    with pytest.raises(ValidationError, match="available: general"):
+        service.store_record(title="t", body="b", scope="nope")
+
+
+def test_scope_added_to_the_config_file_is_accepted_without_a_restart(
+    service: MemoryService, config_manager
+) -> None:
+    with pytest.raises(ValidationError):
+        service.store_record(title="t", body="b", scope="hobby")
+    text = config_manager.path.read_text().replace('"work",', '"work",\n    "hobby",', 1)
+    config_manager.path.write_text(text)
+    record, _ = service.store_record(title="t", body="b", scope="hobby")
+    assert record.scope == "hobby"

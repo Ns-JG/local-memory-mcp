@@ -11,15 +11,19 @@ from __future__ import annotations
 
 import hashlib
 import re
+import shutil
 from collections.abc import Iterator, Sequence
+from pathlib import Path
 
 import numpy as np
 import pytest
 
-from local_memory.embedder import Embedder
-from local_memory.models import ModelSpec
+from local_memory.config import Config, ConfigManager
+from local_memory.embedders import Embedder, ModelSpec
 from local_memory.service import MemoryService
-from local_memory.store import Store
+from local_memory.storage import Store
+
+TEMPLATE = Path(__file__).parents[1] / "config.toml"
 
 _TOKEN = re.compile(r"\w+")
 FAKE_DIM = 256
@@ -67,14 +71,29 @@ def embedder() -> FakeEmbedder:
 
 
 @pytest.fixture
+def config_manager(tmp_path) -> ConfigManager:
+    """The shipped template plus a ``personal`` scope, in a throwaway file."""
+    text = TEMPLATE.read_text().replace('"work",', '"work",\n    "personal",', 1)
+    path = tmp_path / "config.toml"
+    path.write_text(text)
+    shutil.copy(TEMPLATE.with_name("local_memory_instructions.md"), tmp_path)
+    return ConfigManager(path)
+
+
+@pytest.fixture
+def config(config_manager: ConfigManager) -> Config:
+    return config_manager.load()
+
+
+@pytest.fixture
 def store(tmp_path) -> Iterator[Store]:
     with Store(tmp_path / "memory.db") as opened:
         yield opened
 
 
 @pytest.fixture
-def service(store: Store, embedder: FakeEmbedder) -> MemoryService:
-    return MemoryService(store, embedder, dedup_threshold=0.92, rrf_k=60)
+def service(store: Store, embedder: FakeEmbedder, config_manager: ConfigManager) -> MemoryService:
+    return MemoryService(store, embedder, config_manager.load)
 
 
 def make_embedder() -> Embedder:

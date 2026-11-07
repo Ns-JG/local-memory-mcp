@@ -13,63 +13,25 @@ the place where logic lives:
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
-from typing import Any
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any
 
-from .embedder import build_embedder
-from .models import (
-    SEED_KINDS,
-    Config,
-    ConflictError,
-    LocalMemoryError,
-    NotFoundError,
-    ValidationError,
-    load_config,
-    write_default_config,
-)
-from .service import DETAIL_TIERS, MemoryService
-from .store import Store
+from local_memory.app import build_service
+from local_memory.config import Config, ConfigManager
+from local_memory.errors import ConflictError, LocalMemoryError, NotFoundError, ValidationError
+from local_memory.service import DETAIL_TIERS, MemoryService
+
+if TYPE_CHECKING:
+    from fastmcp import FastMCP
 
 SERVER_NAME = "local-memory"
-SERVER_INSTRUCTIONS = (
-    """\
-Local-first long-term memory for NsJG.
-
-Recall is progressive. 
-`memory_search` returns short previews on purpose: run it
-first, then call `memory_get` with an id to read the full record. Do not paste
-whole bodies into context until you have decided you need them.
-
-`memory_store` deduplicates automatically - restating something you already
-stored reinforces the existing record instead of creating a near-duplicate, and
-that is a success, not an error. To replace a record whose content is now
-wrong, pass `supersedes_id` rather than storing a contradictory second copy.
-
-`memory_forget` only requests a deletion. The record leaves search results
-immediately but is not destroyed until NsJG confirms it, so never tell the user
-something has been deleted on the strength of a `memory_forget` call alone.
-
-Kind is an open vocabulary. The seeded kinds are: """
-    + ", ".join(SEED_KINDS)
-    + """. \
-Coin a new kind if none of them fit; it will be registered automatically.
-"""
-)
 
 
-def build_service(config: Config | None = None) -> MemoryService:
-    """Wire the real object graph: store + embedder + dense index."""
-    cfg = config or load_config()
-    write_default_config()
-    embedder = build_embedder(cfg.default_model, cfg.model_cache, threads=cfg.threads)
-    store = Store(cfg.db_path)
-    return MemoryService(store, embedder, dedup_threshold=cfg.dedup_threshold, rrf_k=cfg.rrf_k)
-
-
-def _scope_warnings(service: MemoryService) -> list[str]:
-    from .models import load_config as _load
-
-    return _load().scope_warnings()
+def instructions(config: Config) -> str:
+    text = config.instructions_path.read_text(encoding="utf-8")
+    return text.replace("{seed_kinds}", ", ".join(config.seed_kinds)).replace(
+        "{user_name}", config.user_name
+    )
 
 
 def _record_payload(record: Any, *, include_body: bool = True) -> dict[str, Any]:
@@ -108,7 +70,7 @@ def _hit_payload(hit: Any) -> dict[str, Any]:
     }
 
 
-def register_tools(mcp: Any, service: MemoryService) -> None:
+def register_tools(mcp: Any, service: MemoryService, config: Callable[[], Config]) -> None:
     """Attach the tool set to a FastMCP server instance."""
 
     @mcp.tool()
@@ -124,7 +86,7 @@ def register_tools(mcp: Any, service: MemoryService) -> None:
         Args:
             query: What you are trying to remember, in natural language.
             k: How many results to return.
-            scope: Restrict to one scope (personal, work, uni, general).
+            scope: Restrict to one scope (see `memory_stats` for the available ones).
             kind: Restrict to one kind (e.g. pattern, decision, preference).
             detail: How much of each record to return - "titles", "snippets"
                 (default) or "full". Start with snippets and call `memory_get`
@@ -141,7 +103,7 @@ def register_tools(mcp: Any, service: MemoryService) -> None:
         }
         if detail == "snippets" and hits:
             payload["hint"] = "Previews only. Call memory_get with an id for the full body."
-        warnings = _scope_warnings(service)
+        warnings = config().scope_warnings()
         if warnings:
             payload["scope_warnings"] = warnings
         return json.dumps(payload, indent=2, ensure_ascii=False)
@@ -167,7 +129,7 @@ def register_tools(mcp: Any, service: MemoryService) -> None:
         body: str,
         gist: str = "",
         kind: str = "pattern",
-        scope: str = "general",
+        scope: str | None = None,
         tags: Sequence[str] | None = None,
         supersedes_id: str | None = None,
         confidence: float = 0.5,
@@ -185,7 +147,7 @@ def register_tools(mcp: Any, service: MemoryService) -> None:
                 if omitted; pass one when you can write it better.
             kind: pattern, decision, project, preference, fact, lesson,
                 correction - or a new kind if none of those fit.
-            scope: personal, work, uni, or general.
+            scope: One of the configured scopes; omit to use the default.
             tags: Short lowercase keywords, e.g. ["python", "testing"].
             supersedes_id: Set when this record replaces an existing one. The
                 old record is retired in the same transaction; do not store
@@ -233,7 +195,7 @@ def register_tools(mcp: Any, service: MemoryService) -> None:
         """Request deletion of a record. Pending confirmation, not immediate.
 
         The record stops appearing in search results now, but nothing is
-        destroyed until NsJG confirms. Tell the user a deletion is pending, not
+        destroyed until the user confirms. Tell the user a deletion is pending, not
         that it is done.
 
         Args:
@@ -251,7 +213,7 @@ def register_tools(mcp: Any, service: MemoryService) -> None:
                 "status": record.status,
                 "pending_confirmation": True,
                 "note": (
-                    "Removed from search. NsJG must confirm before it is "
+                    f"Removed from search. {config().user_name} must confirm before it is "
                     "actually deleted. Do not report it as deleted."
                 ),
                 "record": _record_payload(record),
@@ -286,21 +248,26 @@ def register_tools(mcp: Any, service: MemoryService) -> None:
     def memory_stats() -> str:
         """Counts, active embedding model, and configured scope mappings."""
         stats = service.stats()
-        config = load_config()
-        stats["scope_paths"] = {
-            scope: [str(p) for p in rule.paths] for scope, rule in config.scope_paths.items()
+        cfg = config()
+        stats["scopes"] = {
+            name: [str(p) for p in cfg.scopes.rules[name].paths] if name in cfg.scopes.rules else []
+            for name in cfg.scopes.available
         }
-        stats["scope_warnings"] = config.scope_warnings()
+        stats["default_scope"] = cfg.scopes.default
+        stats["scope_warnings"] = cfg.scope_warnings()
         return json.dumps(stats, indent=2, ensure_ascii=False)
 
 
-def build_server(service: MemoryService | None = None) -> Any:
+def build_server(
+    service: MemoryService | None = None, manager: ConfigManager | None = None
+) -> FastMCP:
     """A FastMCP server with the tool set attached."""
     from fastmcp import FastMCP
 
-    mcp = FastMCP(name=SERVER_NAME, instructions=SERVER_INSTRUCTIONS)
-    register_tools(mcp, service or build_service())
+    manager = manager or ConfigManager()
+    mcp = FastMCP(name=SERVER_NAME, instructions=instructions(manager.load()))
+    register_tools(mcp, service or build_service(manager), manager.load)
     return mcp
 
 
-__all__ = ["DETAIL_TIERS", "SERVER_NAME", "build_server", "build_service", "register_tools"]
+__all__ = ["DETAIL_TIERS", "SERVER_NAME", "build_server", "instructions", "register_tools"]

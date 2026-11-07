@@ -26,7 +26,7 @@ conversations to a third-party API. This does it locally instead:
 ## Install
 
 ```sh
-cd /Users/nsjg/Desktop/priv-projects/local_memory
+cd /path/to/local_memory
 uv sync
 uv run local-memory doctor      # verifies the store and model agree
 ```
@@ -39,10 +39,12 @@ warm.
 
 Both clients spawn the server on demand, so there is nothing to daemonise.
 
+Use the absolute path of your checkout wherever `/path/to/local_memory` appears.
+
 ```sh
 # Claude Code
 claude mcp add --scope user local-memory -- \
-  /Users/nsjg/Desktop/priv-projects/local_memory/.venv/bin/local-memory-stdio
+  /path/to/local_memory/.venv/bin/local-memory-stdio
 
 # verify
 claude mcp list
@@ -56,7 +58,7 @@ For OpenCode, add to `~/.config/opencode/opencode.jsonc`:
   "mcp": {
     "local-memory": {
       "type": "local",
-      "command": ["/Users/nsjg/Desktop/priv-projects/local_memory/.venv/bin/local-memory-stdio"],
+      "command": ["/path/to/local_memory/.venv/bin/local-memory-stdio"],
       "enabled": true,
       "timeout": 15000
     }
@@ -66,6 +68,18 @@ For OpenCode, add to `~/.config/opencode/opencode.jsonc`:
 
 `timeout` is in milliseconds and defaults to 5000. The 15000 leaves headroom for
 the one-off model download on first launch.
+
+To give OpenCode agents the usage guide, install it with:
+
+```sh
+./scripts/install_mcp_instructions.sh              # renders installs/*.md with your scopes and kinds
+./scripts/install_mcp_instructions.sh --uninstall
+```
+
+The templates in `installs/` are general; the script fills in the scopes, kinds and
+paths from your active `config.toml`. Re-run it after you edit them. An installed
+copy that differs is overwritten with a warning, and the previous one is saved to
+`backups/` (gitignored).
 
 ## Tools
 
@@ -87,22 +101,38 @@ are registered automatically.
 The CLI is for you; the MCP tools are for the agent.
 
 ```sh
-uv run local-memory doctor              # store/model consistency check
-uv run local-memory browse              # interactive read-only viewer
-uv run local-memory search "connection pooling" --detail full
-uv run local-memory get <id>
-uv run local-memory reindex             # required after changing model
-uv run local-memory config --json
-uv run local-memory models              # embedding model registry
-uv run local-memory kinds               # seeded vs in-use record kinds
-uv run local-memory purge --yes         # drop tombstones past retention
+uv run local-memory doctor                        # store/model consistency check
+uv run local-memory config [--json]               # resolved configuration
+uv run local-memory export-config <path>          # copy your config.toml to <path>
+uv run local-memory stats                         # record counts, model, kinds
+uv run local-memory search "query" [-k N] [--scope S] [--kind K] [--detail titles|snippets|full]
+uv run local-memory get <id>                      # one record in full
+uv run local-memory browse [--scope S] [--kind K] [--status ST] [--search Q] [-n N] [--no-interactive]
+uv run local-memory reindex [--model M] [--all]   # required after changing model
+uv run local-memory models                        # embedding model registry
+uv run local-memory kinds                         # seeded vs in-use record kinds
+uv run local-memory scopes [path]                 # scope mappings, or resolve a path
+uv run local-memory purge [--yes]                 # drop tombstones past retention
+local-memory-stdio                                # MCP server over stdio (what agents spawn)
+local-memory-http                                 # MCP server over loopback HTTP
 ```
 
 ## Configuration
 
-`~/.config/local-memory/config.toml`, created on first run.
+The repo's [config.toml](config.toml) is a template of defaults. Install it, with
+[local_memory_instructions.md](local_memory_instructions.md), to `~/.config/local-memory/`:
+
+```sh
+./scripts/install_config.sh              # never overwrites an existing file
+./scripts/install_config.sh --uninstall  # backs up config.toml to backups/, then removes both
+```
+
+Edit the installed copy; it is re-read on every call, so changes apply without a
+restart. With no installed copy the repo template is used.
+`local-memory export-config <path>` copies the active file out.
 
 ```toml
+user_name = "<your-name-or-nick>"   # how agents refer to you in the MCP instructions
 db_path = "~/.local/share/local-memory/memory.db"
 model_cache = "~/.cache/local-memory/models"
 default_model = "BAAI/bge-small-en-v1.5"
@@ -110,14 +140,31 @@ threads = 3
 dedup_threshold = 0.92
 rrf_k = 60
 tombstone_retention_days = 730
+gist_max_chars = 200
+instructions_path = "local_memory_instructions.md"   # MCP instructions, relative to this file
+seed_kinds = ["pattern", "decision", "project", "preference", "fact", "lesson", "correction"]
 
-[scope.work]
-paths = ["~/Desktop/VStorm"]
+[bm25]                                   # FTS5 column weights; the key set is fixed
+title = 10.0
+gist = 5.0
+tags = 3.0
+body = 1.0
+
+[server]                                 # HTTP transport, loopback only
+host = "127.0.0.1"
+port = 8787
+
+[scopes]
+available = ["general", "work"]
+default = "general"                      # used when no path matches
+
+[scopes.work]
+paths = ["~/projects/work"]
 ```
 
-Scopes map directory prefixes to labels (`personal`, `work`, `uni`, `general`).
-A scope whose path does not exist produces a warning rather than a failure, so a
-moved project directory is reported, not fatal.
+Every key is required. A scope must be listed in `available` to have a
+`[scopes.<name>]` table. A scope whose path does not exist produces a warning
+rather than a failure, so a moved project directory is reported, not fatal.
 
 ## Optional: HTTP transport
 
@@ -125,8 +172,8 @@ Only needed if you want the server reachable over TCP. It binds loopback only an
 has no authentication.
 
 ```sh
-./scripts/install_http_agent.sh     # LaunchAgent on 127.0.0.1:8787
-./scripts/uninstall_http_agent.sh
+./scripts/install_http_agent.sh              # LaunchAgent on the [server] host/port (127.0.0.1:8787)
+./scripts/install_http_agent.sh --uninstall
 ```
 
 ## Browse
@@ -222,7 +269,7 @@ uv run ruff check .
 uv run ruff format .
 ```
 
-260 tests, about six seconds, no network. Tests use a deterministic fake
+303 tests, about three seconds, no network. Tests use a deterministic fake
 embedder, so nothing is ever downloaded.
 
 Two testing notes specific to this project:

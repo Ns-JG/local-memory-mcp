@@ -967,12 +967,13 @@ wheels = [
 
 [[package]]
 name = "local-memory"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastembed" },
     { name = "fastmcp" },
     { name = "numpy" },
+    { name = "pydantic" },
     { name = "rich" },
 ]
 
@@ -989,6 +990,7 @@ requires-dist = [
     { name = "fastembed", specifier = ">=0.7.0" },
     { name = "fastmcp", specifier = ">=4.0.10" },
     { name = "numpy", specifier = ">=2.0" },
+    { name = "pydantic", specifier = ">=2.7" },
     { name = "rich", specifier = ">=13.6" },
 ]
 

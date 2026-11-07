@@ -11,7 +11,7 @@ import sys
 
 
 def main() -> int:
-    from .server import build_server
+    from local_memory.mcp.server import build_server
 
     try:
         server = build_server()

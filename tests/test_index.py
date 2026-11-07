@@ -5,9 +5,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from local_memory.index import DenseIndex, prefetch_count, rrf_fuse
-from local_memory.models import LocalMemoryError, MemoryRecord, new_id
-from local_memory.store import Store
+from local_memory.errors import LocalMemoryError
+from local_memory.models import MemoryRecord
+from local_memory.retrieval import DenseIndex, prefetch_count, rrf_fuse
+from local_memory.storage import Store
+from local_memory.utils import new_id
 
 
 def rec(**overrides) -> MemoryRecord:

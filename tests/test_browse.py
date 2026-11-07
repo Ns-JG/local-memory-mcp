@@ -13,13 +13,12 @@ import re
 import sys
 
 import pytest
-from conftest import FAKE_DIM, FakeEmbedder
+from conftest import FakeEmbedder
 from rich.console import Console
 
 from local_memory import browse
-from local_memory.models import Config, Status
+from local_memory.models import Status
 from local_memory.service import MemoryService
-from local_memory.store import Store
 
 # -- fixtures ---------------------------------------------------------------
 
@@ -30,14 +29,14 @@ def _record_body(index: int) -> str:
 
 #: Scope and kind vary on *different* periods, so every (scope, kind) pairing
 #: occurs and filter tests cannot accidentally pass by correlation.
-_SCOPES = ("work", "uni", "personal")
+_SCOPES = ("work", "university", "personal")
 _KINDS = ("pattern", "decision", "fact")
 
 
 @pytest.fixture
-def populated(store, embedder):
+def populated(store, embedder, config):
     """A store with 12 active records spanning every scope and kind."""
-    service = MemoryService(store, embedder, dedup_threshold=0.92, rrf_k=60)
+    service = MemoryService(store, embedder, lambda: config)
     ids = []
     for i in range(12):
         stored, outcome = service.store_record(
@@ -55,37 +54,6 @@ def populated(store, embedder):
     return store, service, ids
 
 
-#: A real registry entry whose dimension matches ``FAKE_DIM``, so the viewer
-#: builds a ``MemoryService`` against vectors the fixture actually wrote.
-#: Without this the index raises "stored vectors have dim 256, index expects 384".
-_TEST_MODEL = "minishlab/potion-base-8M"
-
-
-@pytest.fixture(scope="session")
-def _test_model_dim_ok():
-    """Ensure the test model has the expected dimension.
-
-    Runs once per session at fixture setup time, not at module import.
-    """
-    from local_memory.models import MODEL_REGISTRY
-
-    assert MODEL_REGISTRY[_TEST_MODEL].dim == FAKE_DIM
-
-
-@pytest.fixture
-def config(tmp_path, _test_model_dim_ok) -> Config:
-    return Config(
-        db_path=tmp_path / "memory.db",
-        model_cache=tmp_path / "models",
-        default_model=_TEST_MODEL,
-        threads=1,
-        scope_paths={},
-        dedup_threshold=0.92,
-        rrf_k=60,
-        tombstone_retention_days=730,
-    )
-
-
 @pytest.fixture
 def fake_build(monkeypatch):
     """Make the viewer's lazy embedder resolve to the offline fake.
@@ -100,7 +68,7 @@ def fake_build(monkeypatch):
         calls.append(name)
         return embedder
 
-    monkeypatch.setattr("local_memory.embedder.build_embedder", counting)
+    monkeypatch.setattr("local_memory.embedders.embedder.build_embedder", counting)
     return calls
 
 
@@ -172,10 +140,10 @@ def test_count_records_respects_filters(populated):
     assert browse.count_records(store, kind="fact") == 3
     # kind = (i // 3) % 3, scope = i % 3, so:
     #   work   -> i = 0, 3, 6, 9  -> kinds pattern, decision, fact, pattern
-    #   uni    -> i = 1, 4, 7, 10 -> kinds pattern, decision, fact, pattern
+    #   university -> i = 1, 4, 7, 10 -> kinds pattern, decision, fact, pattern
     assert browse.count_records(store, scope="work", kind="pattern") == 2
-    assert browse.count_records(store, scope="uni", kind="decision") == 1
-    assert browse.count_records(store, scope="uni", kind="fact") == 1
+    assert browse.count_records(store, scope="university", kind="decision") == 1
+    assert browse.count_records(store, scope="university", kind="fact") == 1
 
 
 def test_list_records_rejects_bad_limits(populated):
@@ -534,25 +502,23 @@ def test_run_browse_with_initial_search(populated, config, fake_build):
     assert "topic1" in rec.text()
 
 
-def test_run_browse_pages_through_results(config, embedder, fake_build):
+def test_run_browse_pages_through_results(store, config, service, fake_build):
     """More records than one page: paging must load the next window."""
-    with Store(config.db_path) as store:
-        service = MemoryService(store, embedder)
-        for i in range(12):
-            service.store_record(title=f"paged {i}", body=_record_body(i), source="test")
-        rec = browse._RecordingRenderer()
-        browse.run_browse(
-            store,
-            config,
-            limit=5,
-            interactive=True,
-            renderer=rec,
-            stream=io.BytesIO(b"b" * 4 + b"q"),
-        )
-        out = rec.text()
-        # Every record must have been reachable, so no page was skipped.
-        for i in range(12):
-            assert f"paged {i}" in out
+    for i in range(12):
+        service.store_record(title=f"paged {i}", body=_record_body(i), source="test")
+    rec = browse._RecordingRenderer()
+    browse.run_browse(
+        store,
+        config,
+        limit=5,
+        interactive=True,
+        renderer=rec,
+        stream=io.BytesIO(b"b" * 4 + b"q"),
+    )
+    out = rec.text()
+    # Every record must have been reachable, so no page was skipped.
+    for i in range(12):
+        assert f"paged {i}" in out
 
 
 # -- static fallback --------------------------------------------------------
@@ -718,7 +684,7 @@ def test_browse_issues_no_writes(watched, config, fake_build):
     browse.list_records(store, limit=5)
     browse.list_records(store, scope="work", kind="pattern", statuses=("active",), offset=2)
     browse.count_records(store)
-    browse.count_records(store, scope="uni")
+    browse.count_records(store, scope="university")
     browse.list_records(store, limit=3) and browse.build_detail(browse.list_records(store)[0])
     browse.run_static(store, config, limit=5, console=console)
     browse.run_browse(store, config, console=console, stream=io.BytesIO(b"jj/\n\x1bq"))
@@ -751,10 +717,10 @@ def test_browse_does_not_deduplicate(populated, config, fake_build):
 # -- cli wiring -------------------------------------------------------------
 
 
-def test_cli_browse_static(populated, config, monkeypatch):
+def test_cli_browse_static(populated, config_manager, monkeypatch):
     """End-to-end through cmd_browse, with the store and config stubbed."""
     store, _service, _ids = populated
-    monkeypatch.setattr("local_memory.cli.load_config", lambda: config)
+    monkeypatch.setattr("local_memory.cli.ConfigManager", lambda: config_manager)
     monkeypatch.setattr("local_memory.cli.Store", lambda path: store)
     monkeypatch.setattr("sys.argv", ["local-memory", "browse", "-n", "5"])
     monkeypatch.setattr(sys, "stdin", io.StringIO())  # not a tty -> static path

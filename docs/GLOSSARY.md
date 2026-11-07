@@ -210,7 +210,7 @@ better*, which is the opposite of the usual convention. `Store._fts_hits`
 negates it so higher means better, consistently with the cosine channel.
 
 Arguments are per-column weights, applied positionally in declaration order:
-`(title 10, gist 5, body 1, tags 3)` — `BM25_WEIGHTS` in `store.py`. A title is a
+`(title 10, gist 5, body 1, tags 3)` by default — the `[bm25]` table in `config.toml`, mapped onto `FTS_COLUMNS` by name. A title is a
 record's compressed identity, so it dominates; tags outrank the body because a
 body is where most words are least identifying.
 
